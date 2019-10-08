@@ -1,4 +1,6 @@
 import Debug from 'debug';
+import ts from 'typescript';
+import * as ast from './astBuilder';
 import { tilde } from '../jsonPointer';
 import { getSubSchema, JsonSchema, NormalizedSchema, Schema } from './jsonSchema';
 import ReferenceResolver from './referenceResolver';
@@ -19,32 +21,33 @@ export default class DtsGenerator {
         await this.resolver.resolve();
 
         const map = this.convertor.buildSchemaMergedMap(this.resolver.getAllRegisteredSchema(), typeMarker);
-        this.convertor.start();
-        this.walk(map);
-        const result = this.convertor.end();
+
+        const root = this.walk(map, true);
+        const resultFile = ts.createSourceFile('_.d.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+        const printer = ts.createPrinter();
+        const result = printer.printList(ts.ListFormat.Decorators, ts.createNodeArray(root, false), resultFile);
 
         return result;
     }
 
-    private walk(map: any): void {
+    private walk(map: any, root: boolean): ts.Statement[] {
+        const result: ts.Statement[] = [];
         const keys = Object.keys(map).sort();
         for (const key of keys) {
             const value = map[key];
             if (value.hasOwnProperty(typeMarker)) {
                 const schema = value[typeMarker] as Schema;
                 debug(`  walk doProcess: key=${key} schemaId=${schema.id.getAbsoluteId()}`);
-                this.walkSchema(schema);
-                delete value[typeMarker];
+                result.push(this.walkSchema(schema, root))
             }
             if (typeof value === 'object' && Object.keys(value).length > 0) {
-                this.convertor.startNest(key);
-                this.walk(value);
-                this.convertor.endNest();
+                result.push(ast.buildNamespaceNode(key, this.walk(value, false), root));
             }
         }
+        return result;
     }
 
-    private walkSchema(schema: Schema): void {
+    private walkSchema(schema: Schema, root: boolean): ts.DeclarationStatement {
         const normalized = this.normalizeContent(schema);
         this.currentSchema = normalized;
         this.convertor.outputComments(normalized);
@@ -52,12 +55,12 @@ export default class DtsGenerator {
         const type = normalized.content.type;
         switch (type) {
             case 'any':
-                return this.generateAnyTypeModel(normalized);
+                return this.generateAnyTypeModel(normalized, root);
             case 'array':
-                return this.generateTypeCollection(normalized);
+                return this.generateTypeCollection(normalized, root);
             case 'object':
             default:
-                return this.generateDeclareType(normalized);
+                return this.generateDeclareType(normalized, root);
         }
     }
 
@@ -102,51 +105,46 @@ export default class DtsGenerator {
         }
         return Object.assign({}, schema, { content });
     }
-    private generateDeclareType(schema: NormalizedSchema): void {
+    private generateDeclareType(schema: NormalizedSchema, root: boolean): ts.DeclarationStatement {
         const content = schema.content;
         if (content.$ref || content.oneOf || content.anyOf || content.enum || 'const' in content || content.type !== 'object') {
-            this.convertor.outputExportType(schema.id);
-            this.generateTypeProperty(schema, true);
+            const type = this.generateTypeProperty(schema);
+            return ast.buildTypeAliasNode(this.convertor.getLastTypeName(schema.id), type, root);
         } else {
-            this.convertor.startInterfaceNest(schema.id);
-            this.generateProperties(schema);
-            this.convertor.endInterfaceNest();
+            const members = this.generateProperties(schema);
+            return ast.buildInterfaceNode(this.convertor.getLastTypeName(schema.id), members, root);
         }
     }
 
-    private generateAnyTypeModel(schema: NormalizedSchema): void {
-        this.convertor.startInterfaceNest(schema.id);
-        this.convertor.outputRawValue('[name: string]: any; // any', true);
-        this.convertor.endInterfaceNest();
+    private generateAnyTypeModel(schema: NormalizedSchema, root: boolean): ts.DeclarationStatement {
+        const member = ast.buildIndexSignatureNode('name', ast.buildStringKeyword(), ast.buildAnyKeyword());
+        return ast.buildInterfaceNode(this.convertor.getLastTypeName(schema.id), [ member ], root);
     }
 
-    private generateTypeCollection(schema: NormalizedSchema): void {
-        this.convertor.outputExportType(schema.id);
-        this.generateArrayTypeProperty(schema, true);
+    private generateTypeCollection(schema: NormalizedSchema, root: boolean): ts.DeclarationStatement {
+        const type = this.generateArrayTypeProperty(schema);
+        return ast.buildTypeAliasNode(this.convertor.getLastTypeName(schema.id), type, root);
     }
 
-    private generateProperties(baseSchema: NormalizedSchema): void {
+    private generateProperties(baseSchema: NormalizedSchema): ts.TypeElement[] {
+        const result: ts.TypeElement[] = [];
         const content = baseSchema.content;
         if (content.additionalProperties) {
-            this.convertor.outputRawValue('[name: string]: ');
             const schema = this.normalizeContent(baseSchema, '/additionalProperties');
-            if (content.additionalProperties === true) {
-                this.convertor.outputStringTypeName(schema, 'any', true);
-            } else {
-                this.generateTypeProperty(schema, true);
-            }
+            const valueType = content.additionalProperties ? ast.buildAnyKeyword() : this.generateTypeProperty(schema, true);
+            const node = ast.buildIndexSignatureNode('name', ast.buildStringKeyword(), valueType);
+            result.push(ast.addOptionalInformation(node, schema, true));
         }
         if (content.properties) {
             for (const propertyName of Object.keys(content.properties)) {
                 const schema = this.normalizeContent(baseSchema, '/properties/' + tilde(propertyName));
-                this.convertor.outputComments(schema);
-                this.convertor.outputPropertyAttribute(schema);
-                this.convertor.outputPropertyName(schema, propertyName, baseSchema.content.required);
-                this.generateTypeProperty(schema);
+                const node = ast.buildPropertySignature(schema, propertyName, this.generateTypeProperty(schema), baseSchema.content.required);
+                result.push(ast.addOptionalInformation(ast.addComment(node, schema), schema, true));
             }
         }
+        return result;
     }
-    private generateTypeProperty(schema: NormalizedSchema, terminate = true): void {
+    private generateTypeProperty(schema: NormalizedSchema, terminate = true): ts.TypeNode {
         const content = schema.content;
         if (content.$ref) {
             const ref = this.resolver.dereference(content.$ref);
@@ -194,12 +192,12 @@ export default class DtsGenerator {
     }
 
 
-    private generateArrayTypeProperty(schema: NormalizedSchema, terminate = true): void {
+    private generateArrayTypeProperty(schema: NormalizedSchema, terminate = true): ts.TypeNode {
         const items = schema.content.items;
         const minItems = schema.content.minItems;
         const maxItems = schema.content.maxItems;
         if (items == null) {
-            this.convertor.outputStringTypeName(schema, 'any[]', terminate);
+            return ast.buildSimpleArrayNode(ast.buildAnyKeyword());
         } else if (!Array.isArray(items)) {
             this.generateTypeProperty(this.normalizeContent(schema, '/items'), false);
             this.convertor.outputStringTypeName(schema, '[]', terminate);
