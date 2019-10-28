@@ -65,7 +65,7 @@
     "power-assert": "^1.6.1",
     "remap-istanbul": "^0.13.0",
     "rimraf": "^3.0.0",
-    "source-map-support": "^0.5.13",
+    "source-map-support": "^0.5.14",
     "tslint": "^5.20.0",
     "typescript": "^3.6.3"
   }
